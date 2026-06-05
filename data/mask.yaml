@@ -1,0 +1,12 @@
+# Train/val/test sets
+# 画像は ../../01-data/images に格納されています。
+# train.txt / valid.txt は list_dataset_file.py により生成された画像パスリストです。
+
+train: ../../01-data/train.txt
+val: ../../01-data/valid.txt
+test: ../../01-data/valid.txt
+
+# Classes
+nc: 2
+names: ['head', 'mask']
+

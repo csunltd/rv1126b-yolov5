@@ -89,6 +89,115 @@ from utils.torch_utils import select_device, smart_inference_mode
 
 MACOS = platform.system() == "Darwin"  # macOS environment
 
+RKNN_NPU1_PLATFORMS = {"RK1808", "RV1109", "RV1126", "RK3399PRO"}
+RKNN_NPU2_PLATFORMS = {"RK3566", "RK3568", "RK3588", "RK3588S"}
+
+
+def _get_rknn_npu_type(rknpu):
+    """Return RKNN NPU type for the specified Rockchip platform."""
+    if rknpu is None:
+        return None
+
+    platform_name = str(rknpu).upper()
+    if platform_name in RKNN_NPU1_PLATFORMS:
+        return "npu_1"
+    if platform_name in RKNN_NPU2_PLATFORMS:
+        return "npu_2"
+    raise AssertionError(f"{rknpu} not recognized. Supported platforms: "
+                         f"{sorted(RKNN_NPU1_PLATFORMS | RKNN_NPU2_PLATFORMS)}")
+
+
+def _copy_parameter(dst, src):
+    """Copy one parameter tensor without changing the model logic."""
+    with torch.no_grad():
+        dst.copy_(src.detach())
+
+
+def apply_rknn_export_hack(model, rknpu):
+    """Apply RKNN-friendly first-layer replacement for RK1808/RV1109/RV1126/RK3399Pro."""
+    npu_type = _get_rknn_npu_type(rknpu)
+    if npu_type is None:
+        return
+
+    os.environ["RKNN_model_hack"] = npu_type
+    LOGGER.info(f"RKNN: enable export compatibility mode for {str(rknpu).upper()} ({npu_type})")
+
+    # NPU v1 platforms require the Focus/6x6 stem conversion used by the RV1126/RV1109 RKNN flow.
+    if npu_type != "npu_1":
+        return
+
+    try:
+        from models.common import Conv, Focus
+        from models.common_rk_plug_in import surrogate_focus
+    except Exception as e:
+        raise RuntimeError(
+            "RKNN export requires models/common_rk_plug_in.py. "
+            "Please copy the RKNN plugin file into the models/ directory."
+        ) from e
+
+    first_layer = model.model[0]
+    device = next(model.parameters()).device
+
+    if isinstance(first_layer, Focus):
+        LOGGER.info("RKNN: replace Focus layer with surrogate_focus")
+        surrogate_layer = surrogate_focus(
+            int(first_layer.conv.conv.weight.shape[1] / 4),
+            first_layer.conv.conv.weight.shape[0],
+            k=tuple(first_layer.conv.conv.weight.shape[2:4]),
+            s=first_layer.conv.conv.stride,
+            p=first_layer.conv.conv.padding,
+            g=first_layer.conv.conv.groups,
+            act=True,
+        ).to(device)
+
+        _copy_parameter(surrogate_layer.conv.conv.weight, first_layer.conv.conv.weight)
+        if first_layer.conv.conv.bias is not None and surrogate_layer.conv.conv.bias is not None:
+            _copy_parameter(surrogate_layer.conv.conv.bias, first_layer.conv.conv.bias)
+        surrogate_layer.conv.act = first_layer.conv.act
+
+    elif isinstance(first_layer, Conv) and first_layer.conv.kernel_size == (6, 6):
+        LOGGER.info("RKNN: replace 6x6 stem Conv layer with surrogate_focus")
+        surrogate_layer = surrogate_focus(
+            first_layer.conv.weight.shape[1],
+            first_layer.conv.weight.shape[0],
+            k=(3, 3),  # 6 / 2, 6 / 2
+            s=1,
+            p=(1, 1),  # 2 / 2, 2 / 2
+            g=first_layer.conv.groups,
+            act=hasattr(first_layer, "act"),
+        ).to(device)
+
+        with torch.no_grad():
+            surrogate_layer.conv.conv.weight[:, :3, :, :].copy_(first_layer.conv.weight[:, :, ::2, ::2].detach())
+            surrogate_layer.conv.conv.weight[:, 3:6, :, :].copy_(first_layer.conv.weight[:, :, 1::2, ::2].detach())
+            surrogate_layer.conv.conv.weight[:, 6:9, :, :].copy_(first_layer.conv.weight[:, :, ::2, 1::2].detach())
+            surrogate_layer.conv.conv.weight[:, 9:, :, :].copy_(first_layer.conv.weight[:, :, 1::2, 1::2].detach())
+            if first_layer.conv.bias is not None and surrogate_layer.conv.conv.bias is not None:
+                surrogate_layer.conv.conv.bias.copy_(first_layer.conv.bias.detach())
+        surrogate_layer.conv.act = first_layer.act
+
+    else:
+        LOGGER.info("RKNN: first layer does not require RKNN replacement")
+        return
+
+    surrogate_layer.i = first_layer.i
+    surrogate_layer.f = first_layer.f
+    surrogate_layer.eval()
+    model.model[0] = surrogate_layer
+
+
+def save_rknn_anchors(model, file):
+    """Save YOLO anchors required by the RKNN YOLOv5 post-processing demo."""
+    if isinstance(model.model[-1], Detect):
+        LOGGER.info("RKNN: save anchors for RKNN post-processing")
+        rk_anchors = model.model[-1].stride.reshape(3, 1).repeat(1, 3).reshape(-1, 1) * model.model[-1].anchors.reshape(9, 2)
+        rk_anchors = rk_anchors.tolist()
+        LOGGER.info(rk_anchors)
+        with open(file.with_suffix(".anchors.txt"), "w") as anf:
+            anf.write(str(rk_anchors))
+
+
+
 
 class iOSModel(torch.nn.Module):
     """An iOS-compatible wrapper for YOLOv5 models that normalizes input images based on their dimensions."""
@@ -1281,6 +1390,7 @@ def run(
     topk_all=100,  # TF.js NMS: topk for all classes to keep
     iou_thres=0.45,  # TF.js NMS: IoU threshold
     conf_thres=0.25,  # TF.js NMS: confidence threshold
+    rknpu=None,  # Rockchip NPU platform for RKNN-friendly ONNX export, e.g. RV1126
 ):
     """Exports a YOLOv5 model to specified formats including ONNX, TensorRT, CoreML, and TensorFlow.
 
@@ -1309,6 +1419,7 @@ def run(
         topk_all (int): Top-K boxes for all classes to keep for TensorFlow.js NMS. Default is 100.
         iou_thres (float): IoU threshold for NMS. Default is 0.45.
         conf_thres (float): Confidence threshold for NMS. Default is 0.25.
+        rknpu (str | None): Rockchip NPU platform for RKNN-friendly ONNX export, e.g. RV1126.
         mlmodel (bool): Flag to use *.mlmodel for CoreML export. Default is False.
 
     Returns:
@@ -1375,6 +1486,9 @@ def run(
     ch = next(model.parameters()).size(1)  # require input image channels
     im = torch.zeros(batch_size, ch, *imgsz).to(device)  # image size(1,3,320,192) BCHW iDetection
 
+    # RKNN export compatibility
+    apply_rknn_export_hack(model, rknpu)
+
     # Update model
     model.eval()
     for k, m in model.named_modules():
@@ -1382,6 +1496,9 @@ def run(
             m.inplace = inplace
             m.dynamic = dynamic
             m.export = True
+
+    if rknpu:
+        save_rknn_anchors(model, file)
 
     for _ in range(2):
         y = model(im)  # dry runs
@@ -1509,6 +1626,7 @@ def parse_opt(known=False):
         default=["torchscript"],
         help="torchscript, onnx, openvino, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle",
     )
+    parser.add_argument("--rknpu", default=None, help="Rockchip NPU platform for RKNN-friendly ONNX export, e.g. RV1126. For RV1126, --opset 12 is recommended.")
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     print_args(vars(opt))
     return opt
